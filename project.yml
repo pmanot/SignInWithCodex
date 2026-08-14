@@ -1,0 +1,48 @@
+name: SignInWithCodexDemo
+options:
+  bundleIdPrefix: dev.signinwithcodex
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+packages:
+  SignInWithCodex:
+    path: .
+targets:
+  SignInWithCodexDemo:
+    type: application
+    platform: iOS
+    sources:
+      - Demo/SignInWithCodexDemo/Sources
+    info:
+      path: Demo/SignInWithCodexDemo/Generated/Info.plist
+      properties:
+        CFBundleDisplayName: Sign In with Codex
+        UILaunchScreen: {}
+        ITSAppUsesNonExemptEncryption: false
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    dependencies:
+      - package: SignInWithCodex
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.signinwithcodex.demo
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1,2"
+schemes:
+  SignInWithCodexDemo:
+    build:
+      targets:
+        SignInWithCodexDemo: all
