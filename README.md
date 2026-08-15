@@ -107,14 +107,6 @@ Select a code-sign team for a physical device. Run the `SignInWithCodexDemo` sch
 
 The package stores OAuth credentials in Keychain with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`.
 
-Do not log `CodexCredential`, authorization callbacks, request headers, or response headers. These values can contain credentials or account identifiers.
+Do NOT log `CodexCredential`, authorization callbacks, request headers, or response headers. These values can contain credentials or account identifiers.
 
 Call `try session.signOut()` to remove the Keychain credential.
-
-## Author
-
-Purav Manot is the sole author of SignInWithCodex.
-
-## License
-
-Purav Manot licenses SignInWithCodex under the MIT License. See [`LICENSE`](LICENSE).
