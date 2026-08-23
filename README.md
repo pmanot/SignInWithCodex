@@ -6,6 +6,17 @@ This package uses the ChatGPT subscription transport from the Codex CLI. It does
 
 This transport is not a stable public API. See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the pinned Codex revision and fallback model.
 
+> ## Warning — read before shipping
+>
+> This package authenticates as the **Codex CLI**: it uses OpenAI's Codex OAuth client ID, sends the Codex `originator` and version headers, and calls the private `chatgpt.com/backend-api/codex` endpoints. It is not an OpenAI product and is not endorsed by OpenAI.
+>
+> - OpenAI's terms restrict how ChatGPT subscriptions may be used outside of OpenAI's own clients. Using this package may violate those terms. **Your users' ChatGPT accounts can be rate-limited, flagged, or banned.**
+> - The transport can change or be blocked at any time without notice. Any release can stop working overnight.
+>
+> ## No guarantees
+>
+> This software is provided **"as is"**, without warranty of any kind, express or implied. The authors accept no liability for account actions, data loss, service interruption, or any other damages arising from its use. There is no commitment to maintain compatibility with future Codex revisions. Use at your own risk, and disclose this risk to your users.
+
 ## Add the package
 
 Add this repository as a Swift package. Select the `SignInWithCodex` library product.
