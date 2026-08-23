@@ -36,18 +36,27 @@ public final class CodexSession: ObservableObject {
     self.authClient = authClient
     self.streamingClient = streamingClient
     self.credentialStore = credentialStore
+    restore()
+  }
 
+  /// Loads the stored credential from Keychain.
+  ///
+  /// The initializer calls this once. Keychain is unavailable before the first
+  /// unlock after boot (for example during a prewarm launch), so call it again
+  /// when the scene becomes active if `isSignedIn` is unexpectedly `false`.
+  @discardableResult
+  public func restore() -> Bool {
+    guard credential == nil else { return true }
     do {
-      if let credential = try credentialStore.load() {
-        self.credential = credential
-        account = CodexAccount(
-          id: credential.accountID,
-          planType: credential.planType
-        )
-        state = .signedIn
-      }
+      guard let stored = try credentialStore.load() else { return false }
+      credential = stored
+      account = CodexAccount(id: stored.accountID, planType: stored.planType)
+      state = .signedIn
+      lastErrorMessage = nil
+      return true
     } catch {
       lastErrorMessage = error.localizedDescription
+      return false
     }
   }
 
@@ -181,6 +190,9 @@ public final class CodexSession: ObservableObject {
   }
 
   private func validCredential() async throws -> CodexCredential {
+    if credential == nil {
+      restore()
+    }
     guard let credential else {
       throw SignInWithCodexError.notSignedIn
     }
