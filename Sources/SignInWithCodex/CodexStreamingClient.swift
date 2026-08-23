@@ -7,7 +7,7 @@ struct CodexStreamingClient: Sendable {
     let models: [Model]
   }
 
-  private struct Model: Decodable, Sendable {
+  fileprivate struct Model: Decodable, Sendable {
     struct ReasoningLevel: Decodable, Sendable {
       let effort: String
     }
@@ -53,19 +53,22 @@ struct CodexStreamingClient: Sendable {
   private let clientVersion: String
   private let installationID: String
   private let threadID: String
+  private let catalog: ModelCatalogCache
 
   init(
     session: URLSession = .shared,
     baseURL: URL = Self.defaultBaseURL,
     clientVersion: String = Self.compatibleCodexVersion,
     installationID: String = UUID().uuidString,
-    threadID: String = UUID().uuidString
+    threadID: String = UUID().uuidString,
+    catalogTTL: TimeInterval = 10 * 60
   ) {
     self.session = session
     self.baseURL = baseURL
     self.clientVersion = clientVersion
     self.installationID = installationID
     self.threadID = threadID
+    catalog = ModelCatalogCache(ttl: catalogTTL)
   }
 
   func perform(
@@ -165,54 +168,69 @@ struct CodexStreamingClient: Sendable {
     return result
   }
 
+  /// Selects a model from the cached catalog.
+  ///
+  /// `.latest` falls back to `fallbackLatestModel` only when the catalog
+  /// request itself fails (network or HTTP error). A catalog that decodes
+  /// incorrectly, a 401, or an explicit `.modelID` that the catalog does not
+  /// list are reported as errors instead of silently substituted.
   private func resolveModel(
     _ selection: CodexModelSelection,
     credential: CodexCredential
   ) async throws -> Model {
+    let models: [Model]
     do {
-      var components = URLComponents(
-        url: endpoint("models"),
-        resolvingAgainstBaseURL: false
-      )!
-      components.queryItems = [
-        URLQueryItem(name: "client_version", value: clientVersion)
-      ]
-      var request = URLRequest(url: components.url!)
-      addCommonHeaders(to: &request, credential: credential)
-      request.setValue("application/json", forHTTPHeaderField: "Accept")
-
-      let (data, response) = try await session.data(for: request)
-      try validate(response, operation: "Codex model discovery", data: data)
-      let models = try JSONDecoder().decode(ModelsResponse.self, from: data).models
-      let sorted = models.enumerated().sorted { left, right in
-        let leftPriority = left.element.priority ?? Int.max
-        let rightPriority = right.element.priority ?? Int.max
-        if leftPriority == rightPriority {
-          return left.offset < right.offset
-        }
-        return leftPriority < rightPriority
-      }.map(\.element)
-
-      switch selection {
-      case .latest:
-        if let visible = sorted.first(where: { $0.visibility == "list" }) {
-          return visible
-        }
-        if let first = sorted.first {
-          return first
-        }
-      case .modelID(let identifier):
-        if let selected = sorted.first(where: { $0.slug == identifier }) {
-          return selected
-        }
+      models = try await catalog.models {
+        try await fetchCatalog(credential: credential)
       }
     } catch SignInWithCodexError.unauthorized {
       throw SignInWithCodexError.unauthorized
+    } catch let error as DecodingError {
+      throw SignInWithCodexError.catalogDecodingFailed(String(describing: error))
     } catch {
+      guard case .latest = selection else { throw error }
       return fallbackModel(for: selection)
     }
 
-    return fallbackModel(for: selection)
+    switch selection {
+    case .latest:
+      if let visible = models.first(where: { $0.visibility == "list" }) ?? models.first {
+        return visible
+      }
+      return fallbackModel(for: selection)
+    case .modelID(let identifier):
+      guard let selected = models.first(where: { $0.slug == identifier }) else {
+        throw SignInWithCodexError.unknownModel(identifier)
+      }
+      return selected
+    }
+  }
+
+  private func fetchCatalog(credential: CodexCredential) async throws -> [Model] {
+    var components = URLComponents(
+      url: endpoint("models"),
+      resolvingAgainstBaseURL: false
+    )!
+    components.queryItems = [
+      URLQueryItem(name: "client_version", value: clientVersion)
+    ]
+    var request = URLRequest(url: components.url!)
+    addCommonHeaders(to: &request, credential: credential)
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+    let (data, response) = try await session.data(for: request)
+    try validate(response, operation: "Codex model discovery", data: data)
+    let models = try JSONDecoder().decode(ModelsResponse.self, from: data).models
+    // Source: OpenAI Codex `codex-rs/models-manager/src/manager.rs`.
+    // Ascending priority; catalog order breaks ties.
+    return models.enumerated().sorted { left, right in
+      let leftPriority = left.element.priority ?? Int.max
+      let rightPriority = right.element.priority ?? Int.max
+      if leftPriority == rightPriority {
+        return left.offset < right.offset
+      }
+      return leftPriority < rightPriority
+    }.map(\.element)
   }
 
   private func fallbackModel(for selection: CodexModelSelection) -> Model {
@@ -468,5 +486,29 @@ struct CodexStreamingClient: Sendable {
 
   private var windowID: String {
     "\(threadID):0"
+  }
+}
+
+/// Caches the model catalog so that consecutive requests do not each pay a
+/// discovery round trip. A failed fetch is not cached.
+private actor ModelCatalogCache {
+  private let ttl: TimeInterval
+  private var models: [CodexStreamingClient.Model]?
+  private var fetchedAt: Date?
+
+  init(ttl: TimeInterval) {
+    self.ttl = ttl
+  }
+
+  func models(
+    fetch: @Sendable () async throws -> [CodexStreamingClient.Model]
+  ) async throws -> [CodexStreamingClient.Model] {
+    if let models, let fetchedAt, Date().timeIntervalSince(fetchedAt) < ttl {
+      return models
+    }
+    let fresh = try await fetch()
+    models = fresh
+    fetchedAt = Date()
+    return fresh
   }
 }

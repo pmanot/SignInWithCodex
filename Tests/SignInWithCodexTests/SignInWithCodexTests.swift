@@ -253,6 +253,59 @@ final class SignInWithCodexTests: XCTestCase {
     XCTAssertEqual(result.text, "Fallback reply")
   }
 
+  func testCatalogIsCachedAcrossRequests() async throws {
+    let session = makeSession()
+    let counter = Counter()
+    URLProtocolStub.handler = { request in
+      switch request.url?.path {
+      case "/backend-api/codex/models":
+        counter.increment()
+        return StubResponse.json(
+          ["models": [["slug": "m1", "priority": 0, "visibility": "list"]]],
+          request: request
+        )
+      default:
+        return StubResponse.sse(
+          """
+          data: {"type":"response.output_text.delta","delta":"ok"}
+
+          """,
+          request: request
+        )
+      }
+    }
+
+    let client = CodexStreamingClient(session: session)
+    for _ in 0..<3 {
+      _ = try await client.perform(
+        CodexRequest(prompt: "Hi"), credential: credential, onEvent: { _ in }
+      )
+    }
+    XCTAssertEqual(counter.value, 1)
+  }
+
+  func testUnknownModelIDIsAnError() async throws {
+    let session = makeSession()
+    URLProtocolStub.handler = { request in
+      StubResponse.json(
+        ["models": [["slug": "m1", "priority": 0, "visibility": "list"]]],
+        request: request
+      )
+    }
+
+    let client = CodexStreamingClient(session: session)
+    do {
+      _ = try await client.perform(
+        CodexRequest(prompt: "Hi", model: .modelID("nope")),
+        credential: credential,
+        onEvent: { _ in }
+      )
+      XCTFail("An unlisted model must fail.")
+    } catch let error as SignInWithCodexError {
+      XCTAssertEqual(error, .unknownModel("nope"))
+    }
+  }
+
   @MainActor
   func testConcurrentStreamsShareOneRefreshAndRejectionEvictsCredential() async throws {
     let session = makeSession()

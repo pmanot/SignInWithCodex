@@ -157,6 +157,8 @@ public enum SignInWithCodexError: LocalizedError, Equatable, Sendable {
   case httpStatus(operation: String, status: Int, message: String?)
   case streamFailed(String)
   case missingOutput
+  case unknownModel(String)
+  case catalogDecodingFailed(String)
   case randomGenerationFailed(Int32)
   case keychain(Int32)
 
@@ -194,6 +196,10 @@ public enum SignInWithCodexError: LocalizedError, Equatable, Sendable {
       return "The Codex response failed: \(message)"
     case .missingOutput:
       return "Codex completed the request without text output."
+    case .unknownModel(let identifier):
+      return "The Codex model catalog does not list \"\(identifier)\"."
+    case .catalogDecodingFailed(let detail):
+      return "The Codex model catalog could not be decoded: \(detail)"
     case .randomGenerationFailed(let status):
       return "Secure random generation failed with status \(status)."
     case .keychain(let status):
