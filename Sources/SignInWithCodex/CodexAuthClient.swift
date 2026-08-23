@@ -230,6 +230,9 @@ struct CodexAuthClient: Sendable {
     guard let http = response as? HTTPURLResponse else {
       throw SignInWithCodexError.invalidResponse
     }
+    if http.statusCode == 401 {
+      throw SignInWithCodexError.unauthorized
+    }
     guard (200..<300).contains(http.statusCode) else {
       throw SignInWithCodexError.httpStatus(
         operation: operation,

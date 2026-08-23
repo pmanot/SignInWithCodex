@@ -253,6 +253,43 @@ final class SignInWithCodexTests: XCTestCase {
     XCTAssertEqual(result.text, "Fallback reply")
   }
 
+  @MainActor
+  func testConcurrentStreamsShareOneRefreshAndRejectionEvictsCredential() async throws {
+    let session = makeSession()
+    let refreshes = Counter()
+    let store = MemoryCredentialStore()
+    let expired = CodexCredential(
+      accessToken: "old", refreshToken: "old-refresh", idToken: "id-token",
+      accountID: "account-id", planType: nil,
+      expiresAt: Date().addingTimeInterval(-60), obtainedAt: Date()
+    )
+    try store.save(expired)
+
+    URLProtocolStub.handler = { request in
+      XCTAssertEqual(request.url?.path, "/oauth/token")
+      refreshes.increment()
+      return StubResponse(
+        status: 401, data: Data("invalid_grant".utf8), headers: [:]
+      )
+    }
+
+    let codex = CodexSession(
+      authClient: CodexAuthClient(session: session),
+      streamingClient: CodexStreamingClient(session: session),
+      credentialStore: store
+    )
+    XCTAssertTrue(codex.isSignedIn)
+
+    async let first: Void = drain(codex.stream(prompt: "a"))
+    async let second: Void = drain(codex.stream(prompt: "b"))
+    _ = await (first, second)
+
+    XCTAssertEqual(refreshes.value, 1)
+    XCTAssertFalse(codex.isSignedIn)
+    XCTAssertEqual(codex.state, .signedOut)
+    XCTAssertNil(try store.load())
+  }
+
   private var credential: CodexCredential {
     CodexCredential(
       accessToken: "access-token",
@@ -298,6 +335,12 @@ final class SignInWithCodexTests: XCTestCase {
   }
 }
 
+private func drain(_ stream: AsyncThrowingStream<CodexStreamEvent, Error>) async {
+  do {
+    for try await _ in stream {}
+  } catch {}
+}
+
 private func requestBody(_ request: URLRequest) throws -> Data {
   if let body = request.httpBody {
     return body
@@ -319,6 +362,20 @@ private func requestBody(_ request: URLRequest) throws -> Data {
     body.append(buffer, count: count)
   }
   return body
+}
+
+private final class Counter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+  var value: Int { lock.withLock { count } }
+  func increment() { lock.withLock { count += 1 } }
+}
+
+private final class MemoryCredentialStore: CredentialStoring {
+  private var stored: CodexCredential?
+  func load() throws -> CodexCredential? { stored }
+  func save(_ credential: CodexCredential) throws { stored = credential }
+  func delete() throws { stored = nil }
 }
 
 private actor EventCollector {

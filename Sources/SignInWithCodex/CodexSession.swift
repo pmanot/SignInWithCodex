@@ -19,6 +19,7 @@ public final class CodexSession: ObservableObject {
   private var credential: CodexCredential?
   private var callbackServer: LocalOAuthCallbackServer?
   private var signInTask: Task<Void, Never>?
+  private var refreshTask: Task<CodexCredential, Error>?
 
   public convenience init(keychainService: String? = nil) {
     self.init(
@@ -95,6 +96,8 @@ public final class CodexSession: ObservableObject {
 
   public func signOut() throws {
     cancelSignIn()
+    refreshTask?.cancel()
+    refreshTask = nil
     try credentialStore.delete()
     credential = nil
     account = nil
@@ -202,11 +205,51 @@ public final class CodexSession: ObservableObject {
     return credential
   }
 
-  private func refresh(_ credential: CodexCredential) async throws -> CodexCredential {
-    let refreshed = try await authClient.refreshCredential(credential)
-    try credentialStore.save(refreshed)
-    apply(refreshed)
-    return refreshed
+  /// Refreshes `stale`, coalescing concurrent callers onto one token request.
+  ///
+  /// The token endpoint rotates refresh tokens, so two parallel refreshes with
+  /// the same token would invalidate each other. A refresh that the server
+  /// rejects outright means the credential is dead; it is removed and the
+  /// session returns to `signedOut`.
+  private func refresh(_ stale: CodexCredential) async throws -> CodexCredential {
+    if let current = credential, current != stale {
+      // Another caller already refreshed while we waited.
+      return current
+    }
+    if let refreshTask {
+      return try await refreshTask.value
+    }
+
+    let task = Task { [authClient] in
+      try await authClient.refreshCredential(stale)
+    }
+    refreshTask = task
+    defer { refreshTask = nil }
+
+    do {
+      let refreshed = try await task.value
+      try credentialStore.save(refreshed)
+      apply(refreshed)
+      return refreshed
+    } catch SignInWithCodexError.unauthorized {
+      evictCredential()
+      throw SignInWithCodexError.notSignedIn
+    } catch let SignInWithCodexError.httpStatus(operation, status, message)
+      where status == 400
+    {
+      // `invalid_grant`: the refresh token was revoked or already rotated.
+      evictCredential()
+      throw SignInWithCodexError.httpStatus(
+        operation: operation, status: status, message: message
+      )
+    }
+  }
+
+  private func evictCredential() {
+    try? credentialStore.delete()
+    credential = nil
+    account = nil
+    state = .signedOut
   }
 
   private func apply(_ credential: CodexCredential) {
