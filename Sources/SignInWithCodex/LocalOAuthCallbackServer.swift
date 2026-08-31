@@ -13,6 +13,7 @@ final class LocalOAuthCallbackServer: @unchecked Sendable {
   private let queue: DispatchQueue
   private var listenerSources: [DispatchSourceRead] = []
   private var clients: [Int32: ClientConnection] = [:]
+  private var expectedState: String?
   private var didReceiveCallback = false
 
   private init(
@@ -47,6 +48,16 @@ final class LocalOAuthCallbackServer: @unchecked Sendable {
       }
     }
     throw SignInWithCodexError.callbackServerUnavailable
+  }
+
+  /// Sets the OAuth `state` value that a callback must carry.
+  ///
+  /// Callbacks that arrive before this is set, or that carry another value,
+  /// are answered with `400` and do not consume the sign-in attempt.
+  func expect(state: String) {
+    queue.async { [weak self] in
+      self?.expectedState = state
+    }
   }
 
   func stop() {
@@ -183,6 +194,16 @@ final class LocalOAuthCallbackServer: @unchecked Sendable {
   }
 
   private func startReading(_ descriptor: Int32) {
+    // A browser that closes the connection early must not raise SIGPIPE and
+    // terminate the process; `write` reports EPIPE instead.
+    var noSIGPIPE: Int32 = 1
+    setsockopt(
+      descriptor,
+      SOL_SOCKET,
+      SO_NOSIGPIPE,
+      &noSIGPIPE,
+      socklen_t(MemoryLayout<Int32>.size)
+    )
     let client = ClientConnection(fileDescriptor: descriptor, queue: queue)
     clients[descriptor] = client
     client.source.setEventHandler { [weak self, weak client] in
@@ -238,6 +259,19 @@ final class LocalOAuthCallbackServer: @unchecked Sendable {
 
     guard requestURL.path == "/auth/callback" else {
       respond(status: 404, body: "Not Found", to: client)
+      return
+    }
+    // Source: OpenAI Codex `codex-rs/login/src/server.rs`. The state check
+    // happens before the callback counts, so a stray request cannot end the
+    // sign-in attempt.
+    let callbackState = URLComponents(url: requestURL, resolvingAgainstBaseURL: false)?
+      .queryItems?
+      .first(where: { $0.name == "state" })?
+      .value
+    guard let expectedState, let callbackState, !callbackState.isEmpty,
+      callbackState == expectedState
+    else {
+      respond(status: 400, body: "State mismatch", to: client)
       return
     }
     guard !didReceiveCallback else {
@@ -315,14 +349,14 @@ final class LocalOAuthCallbackServer: @unchecked Sendable {
         <meta charset="utf-8">
         <meta name="color-scheme" content="light dark">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Signed in with Codex</title>
+        <title>Sign in with Codex</title>
         <style>
           body { font: 16px system-ui; display: grid; min-height: 100vh;
                  margin: 0; place-items: center; text-align: center; }
           main { padding: 24px; }
         </style>
       </head>
-      <body><main><h1>Signed in</h1><p>Close this tab and return to the app.</p></main></body>
+      <body><main><h1>Sign-in received</h1><p>Close this tab and return to the app to finish.</p></main></body>
     </html>
     """
 }

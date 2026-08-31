@@ -89,8 +89,7 @@ final class SignInWithCodexTests: XCTestCase {
           "id_token": idToken,
           "access_token": accessToken,
           "refresh_token": "refresh-token",
-        ],
-        request: request
+        ]
       )
     }
 
@@ -123,6 +122,7 @@ final class SignInWithCodexTests: XCTestCase {
 
   func testLatestModelUsesCatalogPriorityAndStreamsDeltas() async throws {
     let session = makeSession()
+    let threadID = UUID()
     URLProtocolStub.handler = { request in
       switch request.url?.path {
       case "/backend-api/codex/models":
@@ -152,8 +152,7 @@ final class SignInWithCodexTests: XCTestCase {
                 "visibility": "list",
               ],
             ]
-          ],
-          request: request
+          ]
         )
       case "/backend-api/codex/responses":
         let body = try requestBody(request)
@@ -163,6 +162,18 @@ final class SignInWithCodexTests: XCTestCase {
         XCTAssertEqual(json["model"] as? String, "gpt-5.6-sol")
         let reasoning = try XCTUnwrap(json["reasoning"] as? [String: Any])
         XCTAssertEqual(reasoning["effort"] as? String, "medium")
+        XCTAssertEqual(
+          request.value(forHTTPHeaderField: "thread-id"),
+          threadID.uuidString.lowercased()
+        )
+        XCTAssertEqual(
+          request.value(forHTTPHeaderField: "x-client-request-id"),
+          threadID.uuidString.lowercased()
+        )
+        XCTAssertEqual(
+          json["prompt_cache_key"] as? String,
+          threadID.uuidString.lowercased()
+        )
         return StubResponse.sse(
           """
           data: {"type":"response.output_text.delta","delta":"Hello"}
@@ -173,8 +184,7 @@ final class SignInWithCodexTests: XCTestCase {
 
           data: [DONE]
 
-          """,
-          request: request
+          """
         )
       default:
         XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "nil")")
@@ -184,12 +194,11 @@ final class SignInWithCodexTests: XCTestCase {
 
     let client = CodexStreamingClient(
       session: session,
-      installationID: "installation-test",
-      threadID: "thread-test"
+      installationID: "installation-test"
     )
     let collector = EventCollector()
     let result = try await client.perform(
-      CodexRequest(prompt: "Hello"),
+      CodexRequest(prompt: "Hello", threadID: threadID),
       credential: credential,
       onEvent: { event in
         await collector.append(event)
@@ -234,8 +243,7 @@ final class SignInWithCodexTests: XCTestCase {
           """
           data: {"type":"response.completed","response":{"output":[{"content":[{"type":"output_text","text":"Fallback reply"}]}]}}
 
-          """,
-          request: request
+          """
         )
       default:
         return StubResponse(status: 404, data: Data(), headers: [:])
@@ -261,17 +269,10 @@ final class SignInWithCodexTests: XCTestCase {
       case "/backend-api/codex/models":
         counter.increment()
         return StubResponse.json(
-          ["models": [["slug": "m1", "priority": 0, "visibility": "list"]]],
-          request: request
+          ["models": [["slug": "m1", "priority": 0, "visibility": "list"]]]
         )
       default:
-        return StubResponse.sse(
-          """
-          data: {"type":"response.output_text.delta","delta":"ok"}
-
-          """,
-          request: request
-        )
+        return StubResponse.sse(completedStream)
       }
     }
 
@@ -284,12 +285,199 @@ final class SignInWithCodexTests: XCTestCase {
     XCTAssertEqual(counter.value, 1)
   }
 
+  func testConcurrentCatalogMissesShareOneFetch() async throws {
+    let session = makeSession()
+    let counter = Counter()
+    URLProtocolStub.handler = { request in
+      switch request.url?.path {
+      case "/backend-api/codex/models":
+        counter.increment()
+        // Keep the first fetch in flight long enough for the others to miss.
+        Thread.sleep(forTimeInterval: 0.1)
+        return StubResponse.json(
+          ["models": [["slug": "m1", "priority": 0, "visibility": "list"]]]
+        )
+      default:
+        return StubResponse.sse(completedStream)
+      }
+    }
+
+    let client = CodexStreamingClient(session: session)
+    let credential = self.credential
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for prompt in ["a", "b", "c"] {
+        group.addTask {
+          _ = try await client.perform(
+            CodexRequest(prompt: prompt), credential: credential, onEvent: { _ in }
+          )
+        }
+      }
+      try await group.waitForAll()
+    }
+    XCTAssertEqual(counter.value, 1)
+  }
+
+  func testCatalogCacheIsScopedToTheAccount() async throws {
+    let session = makeSession()
+    let counter = Counter()
+    URLProtocolStub.handler = { request in
+      switch request.url?.path {
+      case "/backend-api/codex/models":
+        counter.increment()
+        return StubResponse.json(
+          ["models": [["slug": "m1", "priority": 0, "visibility": "list"]]]
+        )
+      default:
+        return StubResponse.sse(completedStream)
+      }
+    }
+
+    let client = CodexStreamingClient(session: session)
+    let first = credential
+    let second = CodexCredential(
+      accessToken: "other-access",
+      refreshToken: "other-refresh",
+      idToken: "other-id",
+      accountID: "other-account",
+      planType: "pro",
+      expiresAt: first.expiresAt,
+      obtainedAt: first.obtainedAt
+    )
+    for credential in [first, first, second, second, first] {
+      _ = try await client.perform(
+        CodexRequest(prompt: "Hi"), credential: credential, onEvent: { _ in }
+      )
+    }
+    XCTAssertEqual(counter.value, 3)
+  }
+
+  func testStreamClosedBeforeCompletionIsAnError() async throws {
+    let session = makeSession()
+    URLProtocolStub.handler = { request in
+      switch request.url?.path {
+      case "/backend-api/codex/models":
+        return StubResponse.json(
+          ["models": [["slug": "m1", "priority": 0, "visibility": "list"]]]
+        )
+      default:
+        return StubResponse.sse(
+          """
+          data: {"type":"response.output_text.delta","delta":"Half an"}
+
+          data: {"type":"response.output_text.delta","delta":" answer"}
+
+          """
+        )
+      }
+    }
+
+    let client = CodexStreamingClient(session: session)
+    let collector = EventCollector()
+    do {
+      _ = try await client.perform(
+        CodexRequest(prompt: "Hi"),
+        credential: credential,
+        onEvent: { event in
+          await collector.append(event)
+        }
+      )
+      XCTFail("A stream without response.completed must fail.")
+    } catch let error as SignInWithCodexError {
+      XCTAssertEqual(error, .streamClosedBeforeCompletion)
+    }
+    let events = await collector.events
+    XCTAssertEqual(
+      events,
+      [
+        .responseStarted(model: "m1"),
+        .textDelta("Half an"),
+        .textDelta(" answer"),
+      ]
+    )
+  }
+
+  func testEachRequestCarriesItsOwnThreadID() async throws {
+    let session = makeSession()
+    let seenThreadIDs = ValueBox<[String]>([])
+    URLProtocolStub.handler = { request in
+      switch request.url?.path {
+      case "/backend-api/codex/models":
+        return StubResponse.json(
+          ["models": [["slug": "m1", "priority": 0, "visibility": "list"]]]
+        )
+      default:
+        let json = try XCTUnwrap(
+          JSONSerialization.jsonObject(with: try requestBody(request))
+            as? [String: Any]
+        )
+        let metadata = try XCTUnwrap(json["client_metadata"] as? [String: Any])
+        let header = try XCTUnwrap(request.value(forHTTPHeaderField: "thread-id"))
+        XCTAssertEqual(request.value(forHTTPHeaderField: "session-id"), header)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-codex-window-id"), "\(header):0")
+        XCTAssertEqual(metadata["thread_id"] as? String, header)
+        XCTAssertEqual(metadata["session_id"] as? String, header)
+        XCTAssertEqual(json["prompt_cache_key"] as? String, header)
+        seenThreadIDs.update { $0.append(header) }
+        return StubResponse.sse(completedStream)
+      }
+    }
+
+    let client = CodexStreamingClient(session: session)
+    let conversation = UUID()
+    for request in [
+      CodexRequest(prompt: "a", threadID: conversation),
+      CodexRequest(prompt: "b", threadID: conversation),
+      CodexRequest(prompt: "c"),
+    ] {
+      _ = try await client.perform(request, credential: credential, onEvent: { _ in })
+    }
+
+    let ids = seenThreadIDs.value
+    XCTAssertEqual(ids.count, 3)
+    XCTAssertEqual(ids[0], conversation.uuidString.lowercased())
+    XCTAssertEqual(ids[1], ids[0])
+    XCTAssertNotEqual(ids[2], ids[0])
+  }
+
+  func testCallbackServerRejectsWrongStateWithoutConsumingSignIn() async throws {
+    let received = ValueBox<[URL]>([])
+    let server = try LocalOAuthCallbackServer.start { url in
+      received.update { $0.append(url) }
+    }
+    defer { server.stop() }
+    server.expect(state: "expected-state")
+
+    func get(_ query: String) async throws -> (status: Int, body: String) {
+      let url = try XCTUnwrap(URL(string: server.redirectURL.absoluteString + query))
+      let (data, response) = try await URLSession.shared.data(from: url)
+      let http = try XCTUnwrap(response as? HTTPURLResponse)
+      return (http.statusCode, String(decoding: data, as: UTF8.self))
+    }
+
+    let missing = try await get("?code=stray")
+    XCTAssertEqual(missing.status, 400)
+    let wrong = try await get("?code=stray&state=wrong-state")
+    XCTAssertEqual(wrong.status, 400)
+    XCTAssertEqual(wrong.body, "State mismatch")
+    XCTAssertTrue(received.value.isEmpty)
+
+    let accepted = try await get("?code=real&state=expected-state")
+    XCTAssertEqual(accepted.status, 200)
+    XCTAssertTrue(accepted.body.contains("Sign-in received"))
+    let urls = received.value
+    XCTAssertEqual(urls.count, 1)
+    XCTAssertEqual(
+      urls.first.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
+        .queryItems?.first(where: { $0.name == "code" })?.value,
+      "real"
+    )
+  }
+
   func testUnknownModelIDIsAnError() async throws {
     let session = makeSession()
     URLProtocolStub.handler = { request in
       StubResponse.json(
-        ["models": [["slug": "m1", "priority": 0, "visibility": "list"]]],
-        request: request
+        ["models": [["slug": "m1", "priority": 0, "visibility": "list"]]]
       )
     }
 
@@ -417,6 +605,21 @@ private func requestBody(_ request: URLRequest) throws -> Data {
   return body
 }
 
+private let completedStream = """
+  data: {"type":"response.output_text.delta","delta":"ok"}
+
+  data: {"type":"response.completed","response":{"output":[]}}
+
+  """
+
+private final class ValueBox<Value>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stored: Value
+  init(_ value: Value) { stored = value }
+  var value: Value { lock.withLock { stored } }
+  func update(_ body: (inout Value) -> Void) { lock.withLock { body(&stored) } }
+}
+
 private final class Counter: @unchecked Sendable {
   private let lock = NSLock()
   private var count = 0
@@ -444,10 +647,7 @@ private struct StubResponse {
   let data: Data
   let headers: [String: String]
 
-  static func json(
-    _ object: Any,
-    request: URLRequest
-  ) -> StubResponse {
+  static func json(_ object: Any) -> StubResponse {
     StubResponse(
       status: 200,
       data: try! JSONSerialization.data(withJSONObject: object),
@@ -455,7 +655,7 @@ private struct StubResponse {
     )
   }
 
-  static func sse(_ body: String, request: URLRequest) -> StubResponse {
+  static func sse(_ body: String) -> StubResponse {
     StubResponse(
       status: 200,
       data: Data(body.utf8),

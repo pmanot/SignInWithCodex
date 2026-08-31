@@ -3,8 +3,10 @@ import SwiftUI
 
 struct ContentView: View {
   @ObservedObject var session: CodexSession
+  @Environment(\.scenePhase) private var scenePhase
 
   @State private var messages: [DemoMessage] = []
+  @State private var threadID = UUID()
   @State private var draft = ""
   @State private var activeModel: String?
   @State private var requestError: String?
@@ -26,6 +28,18 @@ struct ContentView: View {
             Button("Sign Out", action: signOut)
           }
         }
+      }
+    }
+    // The session can also sign out on its own when a token refresh is
+    // rejected. The conversation belongs to the account that started it.
+    .onChange(of: session.account?.id) {
+      clearConversation()
+    }
+    // Keychain is unavailable before the first unlock; a prewarm launch can
+    // miss the stored credential, so retry once the scene is active.
+    .onChange(of: scenePhase) {
+      if scenePhase == .active, !session.isSignedIn {
+        session.restore()
       }
     }
   }
@@ -160,16 +174,24 @@ struct ContentView: View {
   }
 
   private func bubble(_ message: DemoMessage) -> some View {
-    Text(message.text.isEmpty ? "…" : message.text)
-      .textSelection(.enabled)
-      .padding(12)
-      .background(
-        message.role == .user
-          ? Color.accentColor.opacity(0.16)
-          : Color.secondary.opacity(0.12),
-        in: RoundedRectangle(cornerRadius: 14)
-      )
-      .frame(maxWidth: .infinity, alignment: .leading)
+    VStack(alignment: .leading, spacing: 6) {
+      Text(message.text.isEmpty ? "…" : message.text)
+        .textSelection(.enabled)
+      if message.isFailed {
+        Text("Incomplete. Not sent with later messages.")
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+      }
+    }
+    .padding(12)
+    .background(
+      message.role == .user
+        ? Color.accentColor.opacity(0.16)
+        : Color.secondary.opacity(0.12),
+      in: RoundedRectangle(cornerRadius: 14)
+    )
+    .opacity(message.isFailed ? 0.6 : 1)
+    .frame(maxWidth: .infinity, alignment: .leading)
   }
 
   private var canSend: Bool {
@@ -193,7 +215,7 @@ struct ContentView: View {
     Task {
       defer { isSending = false }
       do {
-        let request = CodexRequest(messages: requestMessages)
+        let request = CodexRequest(messages: requestMessages, threadID: threadID)
         for try await event in session.stream(request) {
           switch event {
           case .responseStarted(let model):
@@ -207,7 +229,7 @@ struct ContentView: View {
         }
       } catch {
         requestError = error.localizedDescription
-        removeEmptyMessage(assistantID)
+        markFailed(assistantID)
       }
     }
   }
@@ -226,19 +248,31 @@ struct ContentView: View {
     messages[index].text = text
   }
 
-  private func removeEmptyMessage(_ id: UUID) {
-    messages.removeAll { $0.id == id && $0.text.isEmpty }
+  /// A reply that failed mid-stream stays visible but leaves the history that
+  /// later requests send. An empty one is dropped.
+  private func markFailed(_ id: UUID) {
+    guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
+    if messages[index].text.isEmpty {
+      messages.remove(at: index)
+    } else {
+      messages[index].isFailed = true
+    }
   }
 
   private func signOut() {
     do {
+      // The account observer clears the conversation.
       try session.signOut()
-      messages = []
-      activeModel = nil
-      requestError = nil
     } catch {
       requestError = error.localizedDescription
     }
+  }
+
+  private func clearConversation() {
+    messages = []
+    threadID = UUID()
+    activeModel = nil
+    requestError = nil
   }
 }
 
@@ -251,6 +285,7 @@ private struct DemoMessage: Identifiable, Equatable {
   let id: UUID
   let role: Role
   var text: String
+  var isFailed = false
 
   init(id: UUID = UUID(), role: Role, text: String) {
     self.id = id
@@ -259,7 +294,7 @@ private struct DemoMessage: Identifiable, Equatable {
   }
 
   var codexMessage: CodexMessage? {
-    guard !text.isEmpty else { return nil }
+    guard !text.isEmpty, !isFailed else { return nil }
     return CodexMessage(
       id: id,
       role: role == .user ? .user : .assistant,

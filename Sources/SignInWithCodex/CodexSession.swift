@@ -20,6 +20,7 @@ public final class CodexSession: ObservableObject {
   private var callbackServer: LocalOAuthCallbackServer?
   private var signInTask: Task<Void, Never>?
   private var refreshTask: Task<CodexCredential, Error>?
+  private var activeStreams: [UUID: Task<Void, Never>] = [:]
 
   public convenience init(keychainService: String? = nil) {
     self.init(
@@ -73,10 +74,12 @@ public final class CodexSession: ObservableObject {
         }
       }
       callbackServer = server
-      authorization = try authClient.makeAuthorization(
+      let authorization = try authClient.makeAuthorization(
         redirectURL: server.redirectURL,
         preferredProvider: preferredProvider
       )
+      server.expect(state: authorization.state)
+      self.authorization = authorization
       state = .awaitingCallback
     } catch {
       finishSignIn(error: error)
@@ -94,8 +97,14 @@ public final class CodexSession: ObservableObject {
     }
   }
 
+  /// Removes the credential and ends every active stream.
+  ///
+  /// A stream that is refreshing its token when sign-out happens is cancelled;
+  /// a refresh that nevertheless completes afterwards is discarded rather
+  /// than reapplied, so sign-out cannot be undone by an in-flight request.
   public func signOut() throws {
     cancelSignIn()
+    cancelActiveStreams()
     refreshTask?.cancel()
     refreshTask = nil
     try credentialStore.delete()
@@ -113,7 +122,9 @@ public final class CodexSession: ObservableObject {
     _ request: CodexRequest
   ) -> AsyncThrowingStream<CodexStreamEvent, Error> {
     AsyncThrowingStream { continuation in
+      let id = UUID()
       let task = Task { @MainActor [weak self] in
+        defer { self?.activeStreams[id] = nil }
         guard let self else {
           continuation.finish()
           return
@@ -145,6 +156,7 @@ public final class CodexSession: ObservableObject {
           continuation.finish(throwing: error)
         }
       }
+      activeStreams[id] = task
       continuation.onTermination = { _ in
         task.cancel()
       }
@@ -156,7 +168,8 @@ public final class CodexSession: ObservableObject {
     history: [CodexMessage] = [],
     model: CodexModelSelection = .latest,
     reasoningEffort: CodexReasoningEffort? = nil,
-    instructions: String = "Reply directly to the user. No tools are available."
+    instructions: String = "Reply directly to the user. No tools are available.",
+    threadID: UUID = UUID()
   ) -> AsyncThrowingStream<CodexStreamEvent, Error> {
     stream(
       CodexRequest(
@@ -164,7 +177,8 @@ public final class CodexSession: ObservableObject {
         history: history,
         model: model,
         reasoningEffort: reasoningEffort,
-        instructions: instructions
+        instructions: instructions,
+        threadID: threadID
       )
     )
   }
@@ -211,45 +225,69 @@ public final class CodexSession: ObservableObject {
   /// the same token would invalidate each other. A refresh that the server
   /// rejects outright means the credential is dead; it is removed and the
   /// session returns to `signedOut`.
+  ///
+  /// `stale` doubles as the session generation: the result is applied only if
+  /// `stale` is still the current credential once the token request returns.
+  /// Sign-out, eviction, or another sign-in in the meantime all change it, and
+  /// the refreshed credential is then discarded.
   private func refresh(_ stale: CodexCredential) async throws -> CodexCredential {
-    if let current = credential, current != stale {
+    guard let current = credential else {
+      throw SignInWithCodexError.notSignedIn
+    }
+    if current != stale {
       // Another caller already refreshed while we waited.
       return current
     }
     if let refreshTask {
-      return try await refreshTask.value
+      let refreshed = try await refreshTask.value
+      guard credential != nil else { throw SignInWithCodexError.notSignedIn }
+      return refreshed
     }
 
     let task = Task { [authClient] in
       try await authClient.refreshCredential(stale)
     }
     refreshTask = task
-    defer { refreshTask = nil }
+    defer {
+      if refreshTask == task {
+        refreshTask = nil
+      }
+    }
 
     do {
       let refreshed = try await task.value
+      guard credential == stale else { throw SignInWithCodexError.notSignedIn }
       try credentialStore.save(refreshed)
       apply(refreshed)
       return refreshed
     } catch SignInWithCodexError.unauthorized {
-      evictCredential()
+      evictCredential(stale)
       throw SignInWithCodexError.notSignedIn
     } catch let SignInWithCodexError.httpStatus(operation, status, message)
       where status == 400
     {
       // `invalid_grant`: the refresh token was revoked or already rotated.
-      evictCredential()
+      evictCredential(stale)
       throw SignInWithCodexError.httpStatus(
         operation: operation, status: status, message: message
       )
     }
   }
 
-  private func evictCredential() {
+  /// Removes `dead` if it is still the current credential.
+  private func evictCredential(_ dead: CodexCredential) {
+    guard credential == dead else { return }
     try? credentialStore.delete()
     credential = nil
     account = nil
     state = .signedOut
+  }
+
+  private func cancelActiveStreams() {
+    for task in activeStreams.values {
+      task.cancel()
+    }
+    activeStreams.removeAll()
   }
 
   private func apply(_ credential: CodexCredential) {

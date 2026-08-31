@@ -1,12 +1,6 @@
 import Foundation
 import Security
 
-protocol CredentialStoring: AnyObject {
-  func load() throws -> CodexCredential?
-  func save(_ credential: CodexCredential) throws
-  func delete() throws
-}
-
 final class KeychainCredentialStore: CredentialStoring {
   private let service: String
   private let account = "codex-chatgpt"

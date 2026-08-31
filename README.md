@@ -62,6 +62,8 @@ let codex = CodexSession(keychainService: "com.example.app.codex")
 
 ## Present sign-in
 
+The supplied button and sheet are iOS-only. On macOS, the package still signs in, stores credentials, and streams; present `session.authorization?.authorizationURL` yourself (for example with `NSWorkspace.shared.open`) after calling `session.signIn()`, and call `session.cancelSignIn()` if the user abandons the flow.
+
 Use the supplied button:
 
 ```swift
@@ -97,6 +99,14 @@ Task {
 ```
 
 `CodexRequest` also supports conversation history, exact model identifiers, custom instructions, and reasoning effort.
+
+Each request carries a `threadID`. Reuse one value for every turn of a conversation and create a new `UUID()` for each new conversation; Codex scopes its session and prompt-cache identifiers to it.
+
+A stream that ends before Codex sends `response.completed` throws `SignInWithCodexError.streamClosedBeforeCompletion`. Deltas that were already delivered are partial output, not a finished answer. A response that consists only of a refusal throws `SignInWithCodexError.refused` with the model's stated reason.
+
+History is text only. The package does not replay reasoning items between turns, so multi-turn requests carry the visible conversation and nothing else.
+
+`session.signOut()` ends every active stream and discards any token refresh that completes afterwards.
 
 ## Demo application
 

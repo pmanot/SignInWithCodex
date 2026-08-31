@@ -52,7 +52,6 @@ struct CodexStreamingClient: Sendable {
   private let baseURL: URL
   private let clientVersion: String
   private let installationID: String
-  private let threadID: String
   private let catalog: ModelCatalogCache
 
   init(
@@ -60,14 +59,12 @@ struct CodexStreamingClient: Sendable {
     baseURL: URL = Self.defaultBaseURL,
     clientVersion: String = Self.compatibleCodexVersion,
     installationID: String = UUID().uuidString,
-    threadID: String = UUID().uuidString,
     catalogTTL: TimeInterval = 10 * 60
   ) {
     self.session = session
     self.baseURL = baseURL
     self.clientVersion = clientVersion
     self.installationID = installationID
-    self.threadID = threadID
     catalog = ModelCatalogCache(ttl: catalogTTL)
   }
 
@@ -88,6 +85,11 @@ struct CodexStreamingClient: Sendable {
       codexRequest.model,
       credential: credential
     )
+    // Source: OpenAI Codex `codex-rs/core/src/client.rs`. Upstream sends the
+    // thread identifier as the session, thread, and client request ids, and
+    // derives the window id from it.
+    let threadID = codexRequest.threadID.uuidString.lowercased()
+    let windowID = "\(threadID):0"
     var request = URLRequest(url: endpoint("responses"))
     request.httpMethod = "POST"
     addCommonHeaders(to: &request, credential: credential)
@@ -100,7 +102,12 @@ struct CodexStreamingClient: Sendable {
     if model.useResponsesLite == true {
       request.setValue("true", forHTTPHeaderField: Self.responsesLiteHeader)
     }
-    request.httpBody = try responseBody(for: codexRequest, model: model)
+    request.httpBody = try responseBody(
+      for: codexRequest,
+      model: model,
+      threadID: threadID,
+      windowID: windowID
+    )
 
     let (bytes, response) = try await session.bytes(for: request)
     guard let http = response as? HTTPURLResponse else {
@@ -117,7 +124,7 @@ struct CodexStreamingClient: Sendable {
 
     await onEvent(.responseStarted(model: model.slug))
 
-    var output = ""
+    var stream = StreamState()
     var dataLines: [String] = []
     var lineData = Data()
     for try await byte in bytes {
@@ -133,39 +140,57 @@ struct CodexStreamingClient: Sendable {
       }
       lineData.removeAll(keepingCapacity: true)
       if line.isEmpty {
-        try await consume(
-          dataLines,
-          output: &output,
-          onEvent: onEvent
-        )
+        try await consume(dataLines, into: &stream, onEvent: onEvent)
         dataLines.removeAll(keepingCapacity: true)
+        // Source: OpenAI Codex `codex-rs/codex-api/src/sse/responses.rs`.
+        // `response.completed` ends the response; do not wait for the
+        // server to close the connection.
+        if stream.isCompleted {
+          break
+        }
       } else if line.hasPrefix("data:") {
         dataLines.append(
           String(line.dropFirst(5).drop(while: { $0 == " " }))
         )
       }
     }
-    if !lineData.isEmpty {
-      if lineData.last == 0x0D {
-        lineData.removeLast()
+    if !stream.isCompleted {
+      if !lineData.isEmpty {
+        if lineData.last == 0x0D {
+          lineData.removeLast()
+        }
+        guard let line = String(data: lineData, encoding: .utf8) else {
+          throw SignInWithCodexError.invalidResponse
+        }
+        if line.hasPrefix("data:") {
+          dataLines.append(
+            String(line.dropFirst(5).drop(while: { $0 == " " }))
+          )
+        }
       }
-      guard let line = String(data: lineData, encoding: .utf8) else {
-        throw SignInWithCodexError.invalidResponse
-      }
-      if line.hasPrefix("data:") {
-        dataLines.append(
-          String(line.dropFirst(5).drop(while: { $0 == " " }))
-        )
-      }
+      try await consume(dataLines, into: &stream, onEvent: onEvent)
     }
-    try await consume(dataLines, output: &output, onEvent: onEvent)
 
-    guard !output.isEmpty else {
+    // A stream that ends without `response.completed` is an error, not a
+    // short answer.
+    guard stream.isCompleted else {
+      throw SignInWithCodexError.streamClosedBeforeCompletion
+    }
+    guard !stream.output.isEmpty else {
+      if !stream.refusal.isEmpty {
+        throw SignInWithCodexError.refused(stream.refusal)
+      }
       throw SignInWithCodexError.missingOutput
     }
-    let result = CodexResponse(text: output, model: model.slug)
+    let result = CodexResponse(text: stream.output, model: model.slug)
     await onEvent(.completed(result))
     return result
+  }
+
+  private struct StreamState {
+    var output = ""
+    var refusal = ""
+    var isCompleted = false
   }
 
   /// Selects a model from the cached catalog.
@@ -180,7 +205,7 @@ struct CodexStreamingClient: Sendable {
   ) async throws -> Model {
     let models: [Model]
     do {
-      models = try await catalog.models {
+      models = try await catalog.models(for: credential.accountID) {
         try await fetchCatalog(credential: credential)
       }
     } catch SignInWithCodexError.unauthorized {
@@ -189,7 +214,7 @@ struct CodexStreamingClient: Sendable {
       throw SignInWithCodexError.catalogDecodingFailed(String(describing: error))
     } catch {
       guard case .latest = selection else { throw error }
-      return fallbackModel(for: selection)
+      return fallbackLatestModel()
     }
 
     switch selection {
@@ -197,7 +222,7 @@ struct CodexStreamingClient: Sendable {
       if let visible = models.first(where: { $0.visibility == "list" }) ?? models.first {
         return visible
       }
-      return fallbackModel(for: selection)
+      return fallbackLatestModel()
     case .modelID(let identifier):
       guard let selected = models.first(where: { $0.slug == identifier }) else {
         throw SignInWithCodexError.unknownModel(identifier)
@@ -233,16 +258,11 @@ struct CodexStreamingClient: Sendable {
     }.map(\.element)
   }
 
-  private func fallbackModel(for selection: CodexModelSelection) -> Model {
-    let slug =
-      switch selection {
-      case .latest:
-        Self.fallbackLatestModel
-      case .modelID(let identifier):
-        identifier
-      }
-    return Model(
-      slug: slug,
+  /// The model used for `.latest` when the catalog is unreachable. Its
+  /// capabilities are assumed, not read from a catalog.
+  private func fallbackLatestModel() -> Model {
+    Model(
+      slug: Self.fallbackLatestModel,
       priority: 0,
       visibility: "list",
       defaultReasoningLevel: "medium",
@@ -281,7 +301,9 @@ struct CodexStreamingClient: Sendable {
 
   private func responseBody(
     for request: CodexRequest,
-    model: Model
+    model: Model,
+    threadID: String,
+    windowID: String
   ) throws -> Data {
     var input: [[String: Any]] = request.messages.map { message in
       [
@@ -381,7 +403,7 @@ struct CodexStreamingClient: Sendable {
 
   private func consume(
     _ dataLines: [String],
-    output: inout String,
+    into stream: inout StreamState,
     onEvent: @escaping EventHandler
   ) async throws {
     let payload = dataLines.joined(separator: "\n")
@@ -398,17 +420,23 @@ struct CodexStreamingClient: Sendable {
     case "response.output_text.delta":
       let delta = event["delta"] as? String ?? ""
       if !delta.isEmpty {
-        output += delta
+        stream.output += delta
         await onEvent(.textDelta(delta))
       }
+    case "response.refusal.delta":
+      stream.refusal += event["delta"] as? String ?? ""
     case "response.completed":
-      if output.isEmpty,
-        let response = event["response"] as? [String: Any]
-      {
-        let text = outputText(in: response)
-        if !text.isEmpty {
-          output = text
-          await onEvent(.textDelta(text))
+      stream.isCompleted = true
+      if let response = event["response"] as? [String: Any] {
+        if stream.output.isEmpty {
+          let text = outputText(in: response, part: "output_text", key: "text")
+          if !text.isEmpty {
+            stream.output = text
+            await onEvent(.textDelta(text))
+          }
+        }
+        if stream.refusal.isEmpty {
+          stream.refusal = outputText(in: response, part: "refusal", key: "refusal")
         }
       }
     case "response.failed":
@@ -451,15 +479,17 @@ struct CodexStreamingClient: Sendable {
     }
   }
 
-  private func outputText(in response: [String: Any]) -> String {
+  /// Concatenates the `key` field of every content part of type `part`.
+  private func outputText(
+    in response: [String: Any],
+    part: String,
+    key: String
+  ) -> String {
     let items = response["output"] as? [[String: Any]] ?? []
     return items.flatMap { item -> [String] in
       let content = item["content"] as? [[String: Any]] ?? []
-      return content.compactMap { part in
-        guard part["type"] as? String == "output_text" else {
-          return nil
-        }
-        return part["text"] as? String
+      return content.compactMap {
+        $0["type"] as? String == part ? $0[key] as? String : nil
       }
     }.joined()
   }
@@ -483,32 +513,57 @@ struct CodexStreamingClient: Sendable {
   private func endpoint(_ path: String) -> URL {
     baseURL.appendingPathComponent(path)
   }
-
-  private var windowID: String {
-    "\(threadID):0"
-  }
 }
 
 /// Caches the model catalog so that consecutive requests do not each pay a
-/// discovery round trip. A failed fetch is not cached.
+/// discovery round trip. The catalog depends on the account's plan, so the
+/// cache holds one entry and discards it when another account asks.
+/// Concurrent misses for the same account share one fetch. A failed fetch is
+/// not cached.
 private actor ModelCatalogCache {
+  typealias Models = [CodexStreamingClient.Model]
+
+  private struct Entry {
+    let accountID: String
+    let models: Models
+    let fetchedAt: Date
+  }
+
+  private struct InFlight {
+    let accountID: String
+    let task: Task<Models, Error>
+  }
+
   private let ttl: TimeInterval
-  private var models: [CodexStreamingClient.Model]?
-  private var fetchedAt: Date?
+  private var entry: Entry?
+  private var inFlight: InFlight?
 
   init(ttl: TimeInterval) {
     self.ttl = ttl
   }
 
   func models(
-    fetch: @Sendable () async throws -> [CodexStreamingClient.Model]
-  ) async throws -> [CodexStreamingClient.Model] {
-    if let models, let fetchedAt, Date().timeIntervalSince(fetchedAt) < ttl {
-      return models
+    for accountID: String,
+    fetch: @escaping @Sendable () async throws -> Models
+  ) async throws -> Models {
+    if let entry, entry.accountID == accountID,
+      Date().timeIntervalSince(entry.fetchedAt) < ttl
+    {
+      return entry.models
     }
-    let fresh = try await fetch()
-    models = fresh
-    fetchedAt = Date()
+    if let inFlight, inFlight.accountID == accountID {
+      return try await inFlight.task.value
+    }
+
+    let task = Task { try await fetch() }
+    inFlight = InFlight(accountID: accountID, task: task)
+    defer {
+      if inFlight?.task == task {
+        inFlight = nil
+      }
+    }
+    let fresh = try await task.value
+    entry = Entry(accountID: accountID, models: fresh, fetchedAt: Date())
     return fresh
   }
 }
